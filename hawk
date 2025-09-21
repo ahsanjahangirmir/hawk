@@ -3,16 +3,20 @@ import os, sys, json, argparse, shlex, subprocess, re
 import urllib.request
 import urllib.error
 
+RESET = "\033[0m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+CYAN = "\033[96m"
+
 APP_NAME = "hawk"
 HISTORY_FILE = os.path.expanduser("~/.hawk_history")
 
 def copy_to_clipboard(text: str):
-    # macOS pbcopy
     p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     p.communicate(input=text.encode("utf-8"))
 
 def run_shell(cmd: str):
-    # Safe-ish default: only allow awk pipelines unless --allow-any (Phase 3)
     subprocess.run(cmd, shell=True, check=False)
 
 def save_history(cmd: str):
@@ -28,52 +32,58 @@ def load_history(n: int = None):
         return lines[-n:]
     return lines
 
+def search_history(term: str):
+    history = load_history()
+    return [cmd for cmd in history if term.lower() in cmd.lower()]
+
 def print_help():
     help_text = f"""
-{APP_NAME} - Natural Language → awk
+{CYAN}✨ Welcome to HAWK ✨{RESET}
+Natural Language → awk command generator
 
 Usage:
-  hawk "<prompt>"         Generate command, copy to clipboard
-  hawk --run "<prompt>"   Generate and run the command directly
-  hawk history [N]        Show the last N commands (default 10)
-  hawk --1                Copy the last command to clipboard
-  hawk --2                Copy the second last command, etc.
+  hawk "<prompt>"            Generate command, copy to clipboard
+  hawk --run "<prompt>"      Generate and run the command directly
+  hawk --dry "<prompt>"      Generate and only show the command
+  hawk --explain "<prompt>"  Generate and copy + show explanation
+  hawk history [N]           Show the last N commands (default 10)
+  hawk history --search STR  Search history for matching commands
+  hawk --1                   Copy the last command to clipboard
+  hawk --2                   Copy the second last command, etc.
+  hawk --teach "<awk cmd>"   Explain an awk command in plain English
+  hawk --interactive         Interactive REPL mode
+  hawk --file FILE.txt       Batch mode: process prompts from a file
 
 Examples:
   hawk "sum the last column in data.csv"
   hawk --run "unique values in second column of file.csv"
   hawk history 20
-  hawk --3
+  hawk history --search sum
+  hawk --teach "awk -F, '{{sum+=$3}} END {{print sum}}' file.csv"
 """
     print(help_text)
 
 def generate_with_ollama(nl: str, model="qwen2.5-coder:3b") -> dict:
-    """
-    Uses Ollama local API to turn natural language into an awk command.
-    Expects a JSON object with 'cmd' and 'explain'.
-    """
     sys_prompt = (
-    "You are an awk command generator.\n"
-    "Your ONLY valid output is strict JSON in the form: {\"cmd\": \"...\", \"explain\": \"...\"}.\n"
-    "Do not output anything else (no code fences, no markdown, no commentary).\n"
-    "\n"
-    "Rules for 'cmd':\n"
-    "1. The command MUST start with 'awk'. You may append safe Unix pipes (sort, uniq, head, tail, cut).\n"
-    "2. When generating distinct/unique values, always prefer 'sort -u' (never 'sort | uniq').\n"
-    "3. Use -F, for CSV and -F'\\t' for TSV if explicitly mentioned.\n"
-    "4. If no file is given, default to 'file.csv'.\n"
-    "5. Do not wrap commands in quotes or add comments.\n"
-    "6. The 'explain' must be a one-line, plain-English summary of what the command does.\n"
-    "7. Never hallucinate tools other than awk + basic pipes. No sed, grep, or jq.\n"
+        "You are an awk command generator.\n"
+        "Your ONLY valid output is strict JSON in the form: {\"cmd\": \"...\", \"explain\": \"...\"}.\n"
+        "Do not output anything else.\n"
+        "\n"
+        "Rules for 'cmd':\n"
+        "1. The command MUST start with 'awk'. You may append safe Unix pipes (sort, uniq, head, tail, cut).\n"
+        "2. When generating distinct/unique values, always prefer 'sort -u' (never 'sort | uniq').\n"
+        "3. Use -F, for CSV and -F'\\t' for TSV if explicitly mentioned.\n"
+        "4. If no file is given, default to 'file.csv'.\n"
+        "5. Do not wrap commands in quotes or add comments.\n"
+        "6. The 'explain' must be a one-line, plain-English summary of what the command does.\n"
+        "7. Never hallucinate tools other than awk + basic pipes. No sed, grep, or jq.\n"
     )
-
     payload = {
         "model": model,
         "prompt": f"{sys_prompt}\nUser: {nl}\nAssistant:",
         "stream": False,
         "options": {"temperature": 0}
     }
-
     try:
         req = urllib.request.Request(
             "http://localhost:11434/api/generate",
@@ -84,8 +94,6 @@ def generate_with_ollama(nl: str, model="qwen2.5-coder:3b") -> dict:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         raw = data.get("response", "").strip()
-
-        # Try to extract JSON from model output
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
             raise ValueError(f"Ollama did not return JSON: {raw}")
@@ -93,14 +101,33 @@ def generate_with_ollama(nl: str, model="qwen2.5-coder:3b") -> dict:
         return {"cmd": obj.get("cmd", "").strip(),
                 "explain": obj.get("explain", "").strip()}
     except Exception as e:
-        raise RuntimeError(f"Failed to get valid response from Ollama: {e}")
+        print(f"{RED}⚠️  Ollama is not running or failed to respond.{RESET}")
+        print(f"{RED}   Start it with: ollama serve   (or check LaunchAgent).{RESET}")
+        sys.exit(1)
+
+def explain_with_ollama(awk_cmd: str, model="qwen2.5-coder:3b") -> str:
+    prompt = f"Explain in plain English what this awk command does:\n{awk_cmd}"
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data.get("response", "").strip()
+    except Exception as e:
+        print("⚠️ Ollama not available for teach mode.")
+        sys.exit(1)
 
 def main():
     if len(sys.argv) == 1:
         print_help()
         sys.exit(0)
 
-    # Handle recall like: hawk --1, hawk --2
+    # Recall commands like: hawk --1
     if re.match(r"--\d+$", sys.argv[1]):
         idx = int(sys.argv[1][2:])
         history = load_history()
@@ -109,22 +136,63 @@ def main():
             sys.exit(1)
         cmd = history[-idx]
         copy_to_clipboard(cmd)
-        print(f"Copied command #{idx} from history:\n{cmd}")
+        print(f"{GREEN}Copied command #{idx} from history:\n{cmd}{RESET}")
         sys.exit(0)
 
-    # Handle history
+    # History handling
     if sys.argv[1] == "history":
-        n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-        history = load_history(n)
-        for i, cmd in enumerate(history, start=len(history) * -1):
-            print(cmd)
+        if len(sys.argv) > 2 and sys.argv[2] == "--search":
+            term = " ".join(sys.argv[3:])
+            results = search_history(term)
+            if results:
+                print(f"{CYAN}" + "\n".join(results) + f"{RESET}")
+            else:
+                print("No matches found.")
+        else:
+            n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+            history = load_history(n)
+            for cmd in history:
+                print(cmd)
         sys.exit(0)
 
-    # Parse standard args
+    # Teach mode
+    if sys.argv[1] == "--teach":
+        awk_cmd = " ".join(sys.argv[2:])
+        explanation = explain_with_ollama(awk_cmd)
+        print(f"{YELLOW}📖 Explanation:{RESET}\n", explanation)
+        sys.exit(0)
+
+    # Interactive mode
+    if sys.argv[1] == "--interactive":
+        print(f"{CYAN}Entering HAWK interactive mode. Type 'exit' to quit.{RESET}")
+        while True:
+            user_in = input("hawk> ").strip()
+            if user_in.lower() in {"exit", "quit"}:
+                break
+            result = generate_with_ollama(user_in)
+            cmd = result["cmd"].strip()
+            print(f"{GREEN}Generated:{RESET} {cmd}")
+            save_history(cmd)
+        sys.exit(0)
+
+    # Batch mode
+    if sys.argv[1] == "--file":
+        file_path = sys.argv[2]
+        with open(file_path, "r") as f:
+            prompts = [line.strip() for line in f if line.strip()]
+        for p in prompts:
+            result = generate_with_ollama(p)
+            cmd = result["cmd"].strip()
+            print(f"{YELLOW}{p}{RESET} → {GREEN}{cmd}{RESET}")
+            save_history(cmd)
+        sys.exit(0)
+
+    # Normal generation
     parser = argparse.ArgumentParser(prog=APP_NAME, description="Natural-language → awk command.")
     parser.add_argument("--run", action="store_true", help="Execute the generated command directly.")
-    parser.add_argument("--explain", action="store_true", help="Print brief explanation (if available).")
-    parser.add_argument("prompt", nargs="+", help="Natural language prompt in quotes.")
+    parser.add_argument("--explain", action="store_true", help="Print explanation too.")
+    parser.add_argument("--dry", action="store_true", help="Show command only (no copy/run).")
+    parser.add_argument("prompt", nargs="+", help="Natural language prompt.")
     args = parser.parse_args()
 
     nl_prompt = " ".join(args.prompt)
@@ -133,14 +201,18 @@ def main():
 
     save_history(cmd)
 
-    if args.run:
-        print(f"▶ Running: {cmd}")
+    if args.dry:
+        print(f"{GREEN}Generated:{RESET} {cmd}")
+        if args.explain:
+            print(f"{CYAN}— {result.get('explain', '')}{RESET}")
+    elif args.run:
+        print(f"{YELLOW}▶ Running: {cmd}{RESET}")
         run_shell(cmd)
     else:
         copy_to_clipboard(cmd)
-        print("Command copied to clipboard successfully.")
+        print(f"{GREEN}Command copied to clipboard successfully.{RESET}")
         if args.explain:
-            print("—", result.get("explain", ""))
+            print(f"{CYAN}— {result.get('explain', '')}{RESET}")
 
 if __name__ == "__main__":
     main()
