@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+import os, sys, json, argparse, shlex, subprocess, re
+import urllib.request
+import urllib.error
+
+APP_NAME = "hawk"
+HISTORY_FILE = os.path.expanduser("~/.hawk_history")
+
+def copy_to_clipboard(text: str):
+    # macOS pbcopy
+    p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+    p.communicate(input=text.encode("utf-8"))
+
+def run_shell(cmd: str):
+    # Safe-ish default: only allow awk pipelines unless --allow-any (Phase 3)
+    subprocess.run(cmd, shell=True, check=False)
+
+def save_history(cmd: str):
+    with open(HISTORY_FILE, "a") as f:
+        f.write(cmd.strip() + "\n")
+
+def load_history(n: int = None):
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    with open(HISTORY_FILE, "r") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    if n:
+        return lines[-n:]
+    return lines
+
+def print_help():
+    help_text = f"""
+{APP_NAME} - Natural Language → awk
+
+Usage:
+  hawk "<prompt>"         Generate command, copy to clipboard
+  hawk --run "<prompt>"   Generate and run the command directly
+  hawk history [N]        Show the last N commands (default 10)
+  hawk --1                Copy the last command to clipboard
+  hawk --2                Copy the second last command, etc.
+
+Examples:
+  hawk "sum the last column in data.csv"
+  hawk --run "unique values in second column of file.csv"
+  hawk history 20
+  hawk --3
+"""
+    print(help_text)
+
+def generate_with_ollama(nl: str, model="qwen2.5-coder:3b") -> dict:
+    """
+    Uses Ollama local API to turn natural language into an awk command.
+    Expects a JSON object with 'cmd' and 'explain'.
+    """
+    sys_prompt = (
+    "You are an awk command generator.\n"
+    "Your ONLY valid output is strict JSON in the form: {\"cmd\": \"...\", \"explain\": \"...\"}.\n"
+    "Do not output anything else (no code fences, no markdown, no commentary).\n"
+    "\n"
+    "Rules for 'cmd':\n"
+    "1. The command MUST start with 'awk'. You may append safe Unix pipes (sort, uniq, head, tail, cut).\n"
+    "2. When generating distinct/unique values, always prefer 'sort -u' (never 'sort | uniq').\n"
+    "3. Use -F, for CSV and -F'\\t' for TSV if explicitly mentioned.\n"
+    "4. If no file is given, default to 'file.csv'.\n"
+    "5. Do not wrap commands in quotes or add comments.\n"
+    "6. The 'explain' must be a one-line, plain-English summary of what the command does.\n"
+    "7. Never hallucinate tools other than awk + basic pipes. No sed, grep, or jq.\n"
+    )
+
+    payload = {
+        "model": model,
+        "prompt": f"{sys_prompt}\nUser: {nl}\nAssistant:",
+        "stream": False,
+        "options": {"temperature": 0}
+    }
+
+    try:
+        req = urllib.request.Request(
+            "http://localhost:11434/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        raw = data.get("response", "").strip()
+
+        # Try to extract JSON from model output
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            raise ValueError(f"Ollama did not return JSON: {raw}")
+        obj = json.loads(match.group(0))
+        return {"cmd": obj.get("cmd", "").strip(),
+                "explain": obj.get("explain", "").strip()}
+    except Exception as e:
+        raise RuntimeError(f"Failed to get valid response from Ollama: {e}")
+
+def main():
+    if len(sys.argv) == 1:
+        print_help()
+        sys.exit(0)
+
+    # Handle recall like: hawk --1, hawk --2
+    if re.match(r"--\d+$", sys.argv[1]):
+        idx = int(sys.argv[1][2:])
+        history = load_history()
+        if idx <= 0 or idx > len(history):
+            print(f"No such command in history: --{idx}")
+            sys.exit(1)
+        cmd = history[-idx]
+        copy_to_clipboard(cmd)
+        print(f"Copied command #{idx} from history:\n{cmd}")
+        sys.exit(0)
+
+    # Handle history
+    if sys.argv[1] == "history":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+        history = load_history(n)
+        for i, cmd in enumerate(history, start=len(history) * -1):
+            print(cmd)
+        sys.exit(0)
+
+    # Parse standard args
+    parser = argparse.ArgumentParser(prog=APP_NAME, description="Natural-language → awk command.")
+    parser.add_argument("--run", action="store_true", help="Execute the generated command directly.")
+    parser.add_argument("--explain", action="store_true", help="Print brief explanation (if available).")
+    parser.add_argument("prompt", nargs="+", help="Natural language prompt in quotes.")
+    args = parser.parse_args()
+
+    nl_prompt = " ".join(args.prompt)
+    result = generate_with_ollama(nl_prompt)
+    cmd = result["cmd"].strip()
+
+    save_history(cmd)
+
+    if args.run:
+        print(f"▶ Running: {cmd}")
+        run_shell(cmd)
+    else:
+        copy_to_clipboard(cmd)
+        print("Command copied to clipboard successfully.")
+        if args.explain:
+            print("—", result.get("explain", ""))
+
+if __name__ == "__main__":
+    main()
