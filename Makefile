@@ -13,6 +13,9 @@ commit:
 push:
 	git push origin main
 
+post:
+	git add . && git commit -m "$(m)" && git push origin main
+
 stats:
 	git log --author="$(author)" --oneline --shortstat --after="$(after)" | \
 	grep 'insertions' | awk '{ add+=$$4; remove+=$$6 } END { print "Added:", add, "Removed:", remove }'
